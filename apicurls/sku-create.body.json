@@ -1,0 +1,10 @@
+{
+	"code"		: "test-skuX",
+	"name"        : "Test SKU X",
+	"description" : "Random SKU for testing",
+	"unit"        : "kg",
+	"mrp"         : {
+		"unit"       : "INR",
+		"value"      : 534.5
+	}
+}
