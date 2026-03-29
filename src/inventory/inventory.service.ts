@@ -1,82 +1,203 @@
-import { v4 } from "uuid";
+import { v4 as uuidv4 } from "uuid";
 import * as Db from "../lib/database";
 import * as Types from "./inventory.types";
 import * as SkuService from "../sku/sku.service";
 
-/**
- * Generate Fresh products in database.
- * @param {number} nproducts the number of products required
- * @return {Promise<string[]>} the UID list of the products generated
- */
-export async function GenerateProducts(nproducts: number): Promise<string[]> {
-	const products = createProductRecords(nproducts);
-
-	const collection = Db.GetCollection<Types.Product>("products");
-	const result = await collection.insertMany(products);
-
-	if (!result.insertedCount) {
-		throw new Error("Products Insert failed");
-	}
-	return products.map(el => el.uid);
-}
-
-/**
- * Activate Product with Sku and Manufacturing Info
- * @param {Types.UUID} uid the UID of the product to Activate
- * @param {string}  skuCode the code of the Sku to Activate with
- * @param {Types.ManufacturingInfo} manufacturing the manufacturing info to Activate with
- */
-export async function ActivateProduct(uid: Types.UUID, skuCode: string, manufacturing: Types.ManufacturingInfo): Promise<void> {
-	const collection = Db.GetCollection<Types.Product>("products");
-
-	const product = await collection.findOne({ uid });
-	if (!product) {
-		throw new Error("Product not found");
-	}
-	if (product.manufacturing) {
-		throw new Error("Product already Activated");
+export async function ReserveInventory(
+	skuCode: string,
+	batchId: string,
+	quantity: number,
+) {
+	const inventory = Db.GetCollection<Types.Inventory>("inventory");
+	const inventoryRecord = await inventory.findOne({
+		"sku.code": skuCode,
+		batchId,
+	});
+	if (!inventoryRecord) {
+		throw new Error(
+			`Reserve Inventory failed: No inventory found with Sku '${skuCode}' and batch '${batchId}'`,
+		);
 	}
 
 	const sku = await SkuService.GetSkuByCode(skuCode);
 	if (!sku) {
-		throw new Error(`SKU '${skuCode}' doesn't exist`);
+		throw new Error(`Reserve Inventory failed: SKU '${skuCode}' not found`);
 	}
 
-	// TODO: type checking on `manufacturing`
-	const result = await collection.updateOne({ uid }, {
-		$set: {
-			sku,
-			manufacturing,
-			status: Types.ProductStatus.Activated
+	let result: Types.Reservation;
+	if (!sku.isSerialized) {
+		result = await Db.RunTransaction(() => {
+			return reserveNonSerializedInventory(inventoryRecord, quantity);
+		})
+	} else {
+		result = await Db.RunTransaction(() => {
+			return reserveSerializedInventory(inventoryRecord, quantity);
+		})
+	}
+
+	return result;
+}
+
+export async function ReceiveInventory(
+	data: Types.ReceiveInventoryObject,
+): Promise<string> {
+	const inventory = Db.GetCollection<Types.Inventory>("inventory");
+
+	const sku = await SkuService.GetSkuByCode(data.skuCode);
+	if (!sku) {
+		throw new Error(
+			`Receive Inventory failed: SKU '${data.skuCode}' not found`,
+		);
+	}
+	const { skuCode, ...inventoryData } = data;
+	const inventoryRecord = {
+		uid: uuidv4(),
+		...inventoryData,
+		sku,
+		// TODO: ensure quantity matches number of items for serialized SKUs
+		reservedQuantity: 0,
+		createdAt: new Date(),
+		updatedAt: new Date(),
+	};
+	const result = await inventory.insertOne(inventoryRecord);
+	if (!result.insertedId) {
+		throw new Error("Receive Inventory failed: Database error");
+	}
+
+	return inventoryRecord.uid;
+}
+
+export async function ReceiveInventoryItems(
+	inventoryUid: string,
+	itemRecords: Types.ReceiveInventoryItemObject[],
+): Promise<string[]> {
+	// TODO: ensure inventory quantity exactly refers to the items in collection
+	// at all times
+	const inventory = Db.GetCollection<Types.Inventory>("inventory");
+	const items = Db.GetCollection<Types.Item>("items");
+
+	const inventoryRecord = await inventory.findOne({ uid: inventoryUid });
+	if (!inventoryRecord) {
+		throw new Error(
+			`Recieve Inventory Items failed: Inventory '${inventoryUid}' not found`,
+		);
+	}
+	if (!inventoryRecord.sku.isSerialized) {
+		throw new Error(
+			`Receive Inventory Items failed: Sku '${inventoryRecord.sku.code}' does not accept items`,
+		);
+	}
+
+	const records = itemRecords.map((el) => ({
+		...el,
+		sku: inventoryRecord.sku,
+		uid: uuidv4(),
+		createdAt: new Date(),
+		updatedAt: new Date(),
+	}));
+	const result = await items.insertMany(records);
+	if (result.insertedCount < itemRecords.length) {
+		// TODO: Handle deletion of partial itemRecords
+		throw new Error("Receive Inventory Items failed: Database error");
+	}
+
+	return records.map((el) => el.uid);
+}
+
+function buildReservationRecord(
+	inventoryUid: string,
+	quantity: number,
+	itemUids: string[] = [],
+): Types.Reservation {
+	return {
+		uid: uuidv4(),
+		inventoryUid,
+		itemUids,
+		quantity,
+		status: Types.ReservationStatus.Active,
+		createdAt: new Date(),
+		updatedAt: new Date(),
+	};
+}
+
+async function reserveSerializedInventory(inventoryRecord: Types.Inventory, quantity: number) {
+	const inventory = Db.GetCollection<Types.Inventory>("inventory");
+	const items = Db.GetCollection<Types.Item>("items");
+	const reservation = Db.GetCollection<Types.Reservation>("reservations");
+
+	// move value from 'quantity' to 'reservedQuantity'
+	// while satisfying invariant `quantity >= 0`
+	const result = await inventory.updateOne(
+		{ uid: inventoryRecord.uid, quantity: { $gte: quantity } },
+		{ $inc: { reservedQuantity: quantity }, $dec: { quantity: quantity } },
+	);
+	if (!result.matchedCount) {
+		throw new Error(`Reserve Inventory failed: Required quantity not available`);
+	}
+
+	const criteria = {
+		inventoryUid: inventoryRecord.uid,
+		status: {
+			$in: [Types.ItemStatus.Fresh, Types.ItemStatus.Returned],
 		},
-	});
-	if (!result.modifiedCount) {
-		throw new Error("Database error");
+	};
+	const availableItems = await items
+		.find(criteria, {
+			limit: quantity,
+			projection: { uid: true },
+		})
+		.toArray();
+	if (availableItems.length < quantity) {
+		// TODO: Ensure control never reaches here
+		console.error(
+			`PANIC: Reserve Inventory failed: Inventory quantity - items count doesn't match`
+		);
+		process.exit(-1);
 	}
-}
 
-/**
- * XRay product - gets product info
- * @param {Types.UUID} uid the UID of the Product to XRay
- * @return {Promise<Types.Product | null>} the product info
- */
-export function XRayProduct(uid: Types.UUID): Promise<Types.Product | null> {
-	const collection = Db.GetCollection<Types.Product>("products");
-	return collection.findOne({ uid });
-}
-
-function createProductRecords(nproducts: number): Types.Product[] {
-	let products: Types.Product[] = [];
-
-	for (let i = 0; i < nproducts; ++i) {
-		products.push({
-			uid           : v4(),
-			manufacturing : null,
-			sku           : null,
-			status		  : Types.ProductStatus.Fresh,
-			createdAt     : new Date(),
-			updatedAt     : new Date(),
-		});
+	const itemUids = availableItems.map((el) => el.uid);
+	const invItemsReserveResult = await items.updateMany(
+		{ uid: { $in: itemUids } },
+		{ $set: { status: Types.ItemStatus.Reserved } },
+	);
+	if (!invItemsReserveResult.acknowledged) {
+		throw new Error(`Reserve Inventory failed: Database Error`);
 	}
-	return products;
+
+	const reservationRecord = buildReservationRecord(
+		inventoryRecord.uid,
+		quantity,
+		itemUids,
+	);
+	const reservationResult =
+		await reservation.insertOne(reservationRecord);
+	if (!reservationResult.insertedId) {
+		throw new Error("Reserve Inventory failed: Database error");
+	}
+	return reservationRecord;
 }
+
+async function reserveNonSerializedInventory(inventoryRecord: Types.Inventory, quantity: number) {
+	const inventory = Db.GetCollection<Types.Inventory>("inventory");
+	const reservation = Db.GetCollection<Types.Reservation>("reservations");
+
+	const result = await inventory.updateOne(
+		{ uid: inventoryRecord.uid, quantity: { $gte: quantity } },
+		{ $inc: { reservedQuantity: quantity }, $dec: { quantity: quantity } },
+	);
+	if (!result.matchedCount) {
+		throw new Error(`Reserve Inventory failed: Required quantity not available`);
+	}
+
+	const reservationRecord = buildReservationRecord(
+		inventoryRecord.uid,
+		quantity,
+	);
+	const reservationResult =
+		await reservation.insertOne(reservationRecord);
+	if (!reservationResult.insertedId) {
+		throw new Error("Reserve Inventory failed: Database error");
+	}
+	return reservationRecord;
+}
+
