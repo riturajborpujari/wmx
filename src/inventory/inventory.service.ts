@@ -4,35 +4,26 @@ import * as Types from "./inventory.types";
 import * as SkuService from "../sku/sku.service";
 
 export async function ReserveInventory(
-	skuCode: string,
-	batchId: string,
+	inventoryUid: string,
 	quantity: number,
 ) {
 	const inventory = Db.GetCollection<Types.Inventory>("inventory");
-	const inventoryRecord = await inventory.findOne({
-		"sku.code": skuCode,
-		batchId,
-	});
+	const inventoryRecord = await inventory.findOne({ uid: inventoryUid });
 	if (!inventoryRecord) {
 		throw new Error(
-			`Reserve Inventory failed: No inventory found with Sku '${skuCode}' and batch '${batchId}'`,
+			`Reserve Inventory failed: Inventory '${inventoryUid}' not found`,
 		);
 	}
 
-	const sku = await SkuService.GetSkuByCode(skuCode);
-	if (!sku) {
-		throw new Error(`Reserve Inventory failed: SKU '${skuCode}' not found`);
-	}
-
 	let result: Types.Reservation;
-	if (!sku.isSerialized) {
+	if (!inventoryRecord.sku.isSerialized) {
 		result = await Db.RunTransaction(() => {
 			return reserveNonSerializedInventory(inventoryRecord, quantity);
-		})
+		});
 	} else {
 		result = await Db.RunTransaction(() => {
 			return reserveSerializedInventory(inventoryRecord, quantity);
-		})
+		});
 	}
 
 	return result;
@@ -54,7 +45,7 @@ export async function ReceiveInventory(
 		uid: uuidv4(),
 		...inventoryData,
 		sku,
-		// TODO: ensure quantity matches number of items for serialized SKUs
+		quantity: sku.isSerialized ? 0 : inventoryData.quantity,
 		reservedQuantity: 0,
 		createdAt: new Date(),
 		updatedAt: new Date(),
@@ -71,8 +62,6 @@ export async function ReceiveInventoryItems(
 	inventoryUid: string,
 	itemRecords: Types.ReceiveInventoryItemObject[],
 ): Promise<string[]> {
-	// TODO: ensure inventory quantity exactly refers to the items in collection
-	// at all times
 	const inventory = Db.GetCollection<Types.Inventory>("inventory");
 	const items = Db.GetCollection<Types.Item>("items");
 
@@ -90,8 +79,8 @@ export async function ReceiveInventoryItems(
 
 	const records = itemRecords.map((el) => ({
 		...el,
-		sku: inventoryRecord.sku,
 		uid: uuidv4(),
+		status: Types.ItemStatus.Fresh,
 		createdAt: new Date(),
 		updatedAt: new Date(),
 	}));
@@ -101,7 +90,29 @@ export async function ReceiveInventoryItems(
 		throw new Error("Receive Inventory Items failed: Database error");
 	}
 
+	// TODO: ensure inventory quantity exactly refers to the items in collection
+	// at all times
+	await inventory.updateOne(
+		{ uid: inventoryRecord.uid },
+		{ $inc: { quantity: records.length } },
+	);
+
 	return records.map((el) => el.uid);
+}
+
+export async function XRayItem(query: string) {
+	const items = Db.GetCollection<Types.Item>("items");
+
+	const result = await items.aggregate([
+		{ $match: { $or: [{ uid: query }, { clientUid: query }] } },
+		{ $lookup: { from: "inventory", localField: "inventoryUid", foreignField: "uid", as: "inventory" } },
+	]).toArray();
+
+	if (!result.length) {
+		throw new Error(`XRayItem failed: Item '${query}' not found`);
+	}
+
+	return result[0];
 }
 
 function buildReservationRecord(
@@ -120,7 +131,10 @@ function buildReservationRecord(
 	};
 }
 
-async function reserveSerializedInventory(inventoryRecord: Types.Inventory, quantity: number) {
+async function reserveSerializedInventory(
+	inventoryRecord: Types.Inventory,
+	quantity: number,
+) {
 	const inventory = Db.GetCollection<Types.Inventory>("inventory");
 	const items = Db.GetCollection<Types.Item>("items");
 	const reservation = Db.GetCollection<Types.Reservation>("reservations");
@@ -129,10 +143,12 @@ async function reserveSerializedInventory(inventoryRecord: Types.Inventory, quan
 	// while satisfying invariant `quantity >= 0`
 	const result = await inventory.updateOne(
 		{ uid: inventoryRecord.uid, quantity: { $gte: quantity } },
-		{ $inc: { reservedQuantity: quantity }, $dec: { quantity: quantity } },
+		{ $inc: { reservedQuantity: quantity, quantity: -quantity } },
 	);
 	if (!result.matchedCount) {
-		throw new Error(`Reserve Inventory failed: Required quantity not available`);
+		throw new Error(
+			`Reserve Inventory failed: Required quantity not available`,
+		);
 	}
 
 	const criteria = {
@@ -150,7 +166,7 @@ async function reserveSerializedInventory(inventoryRecord: Types.Inventory, quan
 	if (availableItems.length < quantity) {
 		// TODO: Ensure control never reaches here
 		console.error(
-			`PANIC: Reserve Inventory failed: Inventory quantity - items count doesn't match`
+			`PANIC: Reserve Inventory failed: Inventory quantity - items count doesn't match`,
 		);
 		process.exit(-1);
 	}
@@ -169,35 +185,52 @@ async function reserveSerializedInventory(inventoryRecord: Types.Inventory, quan
 		quantity,
 		itemUids,
 	);
-	const reservationResult =
-		await reservation.insertOne(reservationRecord);
+	const reservationResult = await reservation.insertOne(reservationRecord);
 	if (!reservationResult.insertedId) {
 		throw new Error("Reserve Inventory failed: Database error");
 	}
 	return reservationRecord;
 }
 
-async function reserveNonSerializedInventory(inventoryRecord: Types.Inventory, quantity: number) {
+async function reserveNonSerializedInventory(
+	inventoryRecord: Types.Inventory,
+	quantity: number,
+) {
 	const inventory = Db.GetCollection<Types.Inventory>("inventory");
 	const reservation = Db.GetCollection<Types.Reservation>("reservations");
 
 	const result = await inventory.updateOne(
 		{ uid: inventoryRecord.uid, quantity: { $gte: quantity } },
-		{ $inc: { reservedQuantity: quantity }, $dec: { quantity: quantity } },
+		{ $inc: { reservedQuantity: quantity, quantity: -quantity } },
 	);
 	if (!result.matchedCount) {
-		throw new Error(`Reserve Inventory failed: Required quantity not available`);
+		throw new Error(
+			`Reserve Inventory failed: Required quantity not available`,
+		);
 	}
 
 	const reservationRecord = buildReservationRecord(
 		inventoryRecord.uid,
 		quantity,
 	);
-	const reservationResult =
-		await reservation.insertOne(reservationRecord);
+	const reservationResult = await reservation.insertOne(reservationRecord);
 	if (!reservationResult.insertedId) {
 		throw new Error("Reserve Inventory failed: Database error");
 	}
 	return reservationRecord;
+}
+
+// Reservations expires automatically after a certain period
+// This method cancels them and replenishes stock quantity
+export async cancelExpiredReservations() {
+	const reservations = Db.GetCollection<Types.Reservation>("reservations");
+	const inventory = Db.GetCollection<Types.Inventory>("inventory");
+	const items = Db.GetCollection<Types.Items>("items");
+
+	const expiryTimestamp = new Date(Date.now() - ReservationAutoCancellationPeriodMs)
+	const expiredReservations = reservations.find({
+		createdAt: { $lt: expiryTimestamp }
+	});
+	// TODO: handle reservation clean up and inventory stock replenishment
 }
 

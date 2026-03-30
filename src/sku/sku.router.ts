@@ -9,7 +9,7 @@ router.get("/:skuCode", async (req: Request, res: Response) => {
 	const sku = await Service.GetSkuByCode(skuCode);
 	if (!sku) {
 		return res.status(404)
-		    .json({
+			.json({
 				success: false,
 				reason: `SKU '${skuCode}' not found`
 			})
@@ -28,7 +28,7 @@ router.post("/", async (req: Request, res: Response) => {
 			success: true,
 			message: "Sku Created"
 		})
-	} catch(err: any) {
+	} catch (err: any) {
 		console.error("ERROR: Sku Create failed:", err.message);
 		return res.json({
 			success: false,

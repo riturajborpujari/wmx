@@ -5,9 +5,9 @@ export type UUID = string;
 export type Item = {
     uid: UUID;
     clientUid: string;
-    sku: SkuTypes.Sku;
-    inventoryUId: UUID;
+    inventoryUid: UUID;
     status: ItemStatus;
+	reservationUid: UUID;
     createdAt: Date;
     updatedAt: Date;
 };
@@ -40,7 +40,7 @@ export type Inventory = {
 export type Reservation = {
 	uid: UUID;
 	inventoryUid: UUID;
-	itemUids: UUID[];
+	// TODO: sku.isSerialized info should be readily available here
 	quantity: number;
 	status: ReservationStatus;
 	createdAt: Date;
@@ -60,5 +60,5 @@ export type ReceiveInventoryObject = Omit<
 
 export type ReceiveInventoryItemObject = Omit<
     Item,
-    "uid" | "createdAt" | "updatedAt"
+    "uid" | "createdAt" | "updatedAt" | "status"
 >;
