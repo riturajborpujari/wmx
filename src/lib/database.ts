@@ -1,7 +1,7 @@
 import { MongoClient, Db, Document, WithTransactionCallback } from "mongodb";
 
 let client: MongoClient;
-let db    : Db;
+let db: Db;
 
 export async function Connect(url: string, dbName: string) {
 	try {
@@ -10,22 +10,22 @@ export async function Connect(url: string, dbName: string) {
 		await client.connect();
 		db = client.db(dbName);
 	} catch (err: any) {
-		throw new Error("Database Connect failed: " + err.message)
+		throw new Error("Database Connect failed: " + err.message);
 	}
 }
 
-export function GetCollection<T extends Document = Document>(collectionName: string) {
+export function GetCollection<T extends Document = Document>(
+	collectionName: string,
+) {
 	return db.collection<T>(collectionName);
 }
 
-export async function RunTransaction<T = any>(handler: WithTransactionCallback<T>): Promise<T> {
+export async function RunTransaction<T = any>(
+	handler: WithTransactionCallback<T>,
+): Promise<T> {
 	// TODO: Add transaction options support
 	const session = client.startSession();
-	try {
-		const result = await session.withTransaction<T>(handler);
-		await session.endSession();
-		return result;
-	} catch (err: any) {
-		throw err;
-	}
+	const result = await session.withTransaction<T>(handler);
+	await session.endSession();
+	return result;
 }

@@ -9,9 +9,9 @@ export async function CreateSku(record: Types.Sku) {
 }
 
 export function GetSkuByCode(code: string): Promise<Types.Sku | null> {
-	return getCollection().findOne({ code }, { projection: { _id: false }});
+	return getCollection().findOne({ code }, { projection: { _id: false } });
 }
 
 function getCollection() {
-    return Db.GetCollection<Types.Sku>("skus");
+	return Db.GetCollection<Types.Sku>("skus");
 }

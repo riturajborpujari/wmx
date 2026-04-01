@@ -8,17 +8,16 @@ router.get("/:skuCode", async (req: Request, res: Response) => {
 	const skuCode = req.params.skuCode as string;
 	const sku = await Service.GetSkuByCode(skuCode);
 	if (!sku) {
-		return res.status(404)
-			.json({
-				success: false,
-				reason: `SKU '${skuCode}' not found`
-			})
+		return res.status(404).json({
+			success: false,
+			reason: `SKU '${skuCode}' not found`,
+		});
 	}
 	return res.json({
 		success: true,
-		data: sku
+		data: sku,
 	});
-})
+});
 
 router.post("/", async (req: Request, res: Response) => {
 	const record = req.body as Types.Sku;
@@ -26,15 +25,15 @@ router.post("/", async (req: Request, res: Response) => {
 		await Service.CreateSku(record);
 		return res.json({
 			success: true,
-			message: "Sku Created"
-		})
+			message: "Sku Created",
+		});
 	} catch (err: any) {
 		console.error("ERROR: Sku Create failed:", err.message);
 		return res.json({
 			success: false,
-			reason: err.message
+			reason: err.message,
 		});
 	}
-})
+});
 
 export default router;
