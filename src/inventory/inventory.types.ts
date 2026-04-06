@@ -13,7 +13,7 @@ export type Item = {
 };
 
 export enum ItemStatus {
-	Fresh = 0,
+	Available = 0,
 	Reserved,
 	Dispatched,
 	Returned,
@@ -31,7 +31,9 @@ export type Inventory = {
 		value: string;
 	};
 	quantity: number;
-	reservedQuantity: number;
+	reservations: {
+		[reservationUid: string]: number,
+	};
 	createdAt: Date;
 	updatedAt: Date;
 	expiryAt: Date;
@@ -40,7 +42,6 @@ export type Inventory = {
 export type Reservation = {
 	uid: UUID;
 	inventoryUid: UUID;
-	// TODO: sku.isSerialized info should be readily available here
 	quantity: number;
 	status: ReservationStatus;
 	invalidation?: {
@@ -52,7 +53,8 @@ export type Reservation = {
 };
 
 export enum ReservationStatus {
-	Active = 1,
+	Created = 0,
+	Active,
 	Fulfilled,
 	Cancelled,
 	Invalidating,
@@ -61,7 +63,7 @@ export enum ReservationStatus {
 
 export type ReceiveInventoryObject = Omit<
 	Inventory,
-	"sku" | "uid" | "createdAt" | "updatedAt" | "reservedQuantity"
+	"sku" | "uid" | "createdAt" | "updatedAt"
 > & { skuCode: string };
 
 export type ReceiveInventoryItemObject = Omit<

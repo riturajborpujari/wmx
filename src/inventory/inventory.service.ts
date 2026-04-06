@@ -9,6 +9,32 @@ const ReservationInvalidationBatchSize = 10;
 const ReservationInvalidationCrashTimeoutMs =
 	ReservationInvalidationTimeoutMs * 10;
 
+/**
+ * Inventory Service uses a eventually accurate model of operations
+ * As such, periodic reconcillation jobs are required to keep
+ * inventory in a accurate state
+ */
+export function InitScheduledJobs() {
+	setInterval(
+		invalidatePartialReservations,
+		ReservationInvalidationTimeoutMs,
+	);
+	console.log(
+		`INFO: Inventory: Schedulued Job: InvalidatePartialReservations: ${ReservationInvalidationTimeoutMs}ms`,
+	);
+	setInterval(invalidateOldReservations, ReservationInvalidationTimeoutMs);
+	console.log(
+		`INFO: Inventory: Scheduled Job: InvalidateOldReservations: ${ReservationInvalidationTimeoutMs}ms`,
+	);
+	setInterval(
+		recoverCrashedInvalidations,
+		ReservationInvalidationCrashTimeoutMs,
+	);
+	console.log(
+		`INFO: Inventory: Scheduled Job: RecoverCrashedInvalidations: ${ReservationInvalidationCrashTimeoutMs}ms`,
+	);
+}
+
 export async function ReserveInventory(inventoryUid: string, quantity: number) {
 	const inventory = Db.GetCollection<Types.Inventory>("inventory");
 	const inventoryRecord = await inventory.findOne({ uid: inventoryUid });
@@ -18,18 +44,11 @@ export async function ReserveInventory(inventoryUid: string, quantity: number) {
 		);
 	}
 
-	let result: Types.Reservation;
 	if (!inventoryRecord.sku.isSerialized) {
-		result = await Db.RunTransaction(() => {
-			return reserveNonSerializedInventory(inventoryRecord, quantity);
-		});
+		return reserveNonSerializedInventory(inventoryRecord, quantity);
 	} else {
-		result = await Db.RunTransaction(() => {
-			return reserveSerializedInventory(inventoryRecord, quantity);
-		});
+		return reserveSerializedInventory(inventoryRecord, quantity);
 	}
-
-	return result;
 }
 
 export async function ReceiveInventory(
@@ -37,25 +56,27 @@ export async function ReceiveInventory(
 ): Promise<string> {
 	const inventory = Db.GetCollection<Types.Inventory>("inventory");
 
-	const sku = await SkuService.GetSkuByCode(data.skuCode);
+	const { skuCode, ...inventoryData } = data;
+	const sku = await SkuService.GetSkuByCode(skuCode);
 	if (!sku) {
 		throw new Error(
 			`Receive Inventory failed: SKU '${data.skuCode}' not found`,
 		);
 	}
-	const { skuCode, ...inventoryData } = data;
-	const inventoryRecord = {
+	const inventoryRecord: Types.Inventory = {
 		uid: uuidv4(),
 		...inventoryData,
 		sku,
 		quantity: sku.isSerialized ? 0 : inventoryData.quantity,
-		reservedQuantity: 0,
+		reservations: {},
 		createdAt: new Date(),
 		updatedAt: new Date(),
 	};
 	const result = await inventory.insertOne(inventoryRecord);
 	if (!result.insertedId) {
-		throw new Error("Receive Inventory failed: Database error");
+		throw new Error(
+			"Receive Inventory failed: Could not insert Inventory record",
+		);
 	}
 
 	return inventoryRecord.uid;
@@ -80,10 +101,10 @@ export async function ReceiveInventoryItems(
 		);
 	}
 
-	const records = itemRecords.map((el) => ({
+	const records: Types.Item[] = itemRecords.map((el) => ({
 		...el,
 		uid: uuidv4(),
-		status: Types.ItemStatus.Fresh,
+		status: Types.ItemStatus.Available,
 		createdAt: new Date(),
 		updatedAt: new Date(),
 	}));
@@ -93,8 +114,6 @@ export async function ReceiveInventoryItems(
 		throw new Error("Receive Inventory Items failed: Database error");
 	}
 
-	// TODO: ensure inventory quantity exactly refers to the items in collection
-	// at all times
 	await inventory.updateOne(
 		{ uid: inventoryRecord.uid },
 		{ $inc: { quantity: records.length } },
@@ -123,23 +142,7 @@ export async function XRayItem(query: string) {
 	if (!result.length) {
 		throw new Error(`XRayItem failed: Item '${query}' not found`);
 	}
-
 	return result[0];
-}
-
-export function InitScheduledJobs() {
-	// TODO: Do we need handle jobs restart / stop?
-	setInterval(invalidateOldReservations, ReservationInvalidationTimeoutMs);
-	console.log(
-		`Inventory Service: InvalidateOldReservations: Job Scheduled at interval ${ReservationInvalidationTimeoutMs}ms`,
-	);
-	setInterval(
-		recoverCrashedInvalidations,
-		ReservationInvalidationCrashTimeoutMs,
-	);
-	console.log(
-		`Inventory Service: RecoverCrashedInvalidations: Job scheduled at interval ${ReservationInvalidationCrashTimeoutMs}ms`,
-	);
 }
 
 function buildReservationRecord(
@@ -150,7 +153,7 @@ function buildReservationRecord(
 		uid: uuidv4(),
 		inventoryUid,
 		quantity,
-		status: Types.ReservationStatus.Active,
+		status: Types.ReservationStatus.Created,
 		createdAt: new Date(),
 		updatedAt: new Date(),
 	};
@@ -162,13 +165,28 @@ async function reserveSerializedInventory(
 ) {
 	const inventory = Db.GetCollection<Types.Inventory>("inventory");
 	const items = Db.GetCollection<Types.Item>("items");
-	const reservation = Db.GetCollection<Types.Reservation>("reservations");
+	const reservations = Db.GetCollection<Types.Reservation>("reservations");
 
-	// move value from 'quantity' to 'reservedQuantity'
-	// while satisfying invariant `quantity >= 0`
+	// Create a reservation record
+	const reservationRecord = buildReservationRecord(
+		inventoryRecord.uid,
+		quantity,
+	);
+	const reservationInsResult =
+		await reservations.insertOne(reservationRecord);
+	if (!reservationInsResult.insertedId) {
+		throw new Error(
+			`Reserve Inventory failed: Could not create reservation record`,
+		);
+	}
+
+	// Acquire Inventory
 	const result = await inventory.updateOne(
 		{ uid: inventoryRecord.uid, quantity: { $gte: quantity } },
-		{ $inc: { reservedQuantity: quantity, quantity: -quantity } },
+		{
+			$inc: { reservedQuantity: quantity, quantity: -quantity },
+			$set: { [`reservations.${reservationRecord.uid}`]: quantity },
+		},
 	);
 	if (!result.matchedCount) {
 		throw new Error(
@@ -176,41 +194,29 @@ async function reserveSerializedInventory(
 		);
 	}
 
-	const criteria = {
-		inventoryUid: inventoryRecord.uid,
-		status: {
-			$in: [Types.ItemStatus.Fresh, Types.ItemStatus.Returned],
-		},
-	};
-	const availableItems = await items
-		.find(criteria, {
-			limit: quantity,
-			projection: { uid: true },
-		})
-		.toArray();
-	if (availableItems.length < quantity) {
-		// TODO: Ensure control never reaches here
-		console.error(
-			`PANIC: Reserve Inventory failed: Inventory quantity - items count doesn't match`,
-		);
-		process.exit(-1);
-	}
-
-	const itemUids = availableItems.map((el) => el.uid);
+	// Acquire Items
 	const invItemsReserveResult = await items.updateMany(
-		{ uid: { $in: itemUids } },
-		{ $set: { status: Types.ItemStatus.Reserved } },
+		{
+			inventoryUid: inventoryRecord.uid,
+			status: Types.ItemStatus.Available,
+		},
+		{
+			$set: {
+				status: Types.ItemStatus.Reserved,
+				reservationUid: reservationRecord.uid,
+			},
+		},
 	);
-	if (!invItemsReserveResult.acknowledged) {
-		throw new Error(`Reserve Inventory failed: Database Error`);
+	if (invItemsReserveResult.modifiedCount < quantity) {
+		throw new Error("Reserve Inventory failed: Could not reserve Items");
 	}
 
-	const reservationRecord = buildReservationRecord(
-		inventoryRecord.uid,
-		quantity,
+	// Activate Reservation
+	const reservationUpdResult = await reservations.updateOne(
+		{ uid: reservationRecord.uid },
+		{ $set: { status: Types.ReservationStatus.Active } },
 	);
-	const reservationResult = await reservation.insertOne(reservationRecord);
-	if (!reservationResult.insertedId) {
+	if (!reservationUpdResult.modifiedCount) {
 		throw new Error("Reserve Inventory failed: Database error");
 	}
 	return reservationRecord;
@@ -221,11 +227,28 @@ async function reserveNonSerializedInventory(
 	quantity: number,
 ) {
 	const inventory = Db.GetCollection<Types.Inventory>("inventory");
-	const reservation = Db.GetCollection<Types.Reservation>("reservations");
+	const reservations = Db.GetCollection<Types.Reservation>("reservations");
 
+	// Create a reservation record
+	const reservationRecord = buildReservationRecord(
+		inventoryRecord.uid,
+		quantity,
+	);
+	const reservationInsResult =
+		await reservations.insertOne(reservationRecord);
+	if (!reservationInsResult.insertedId) {
+		throw new Error(
+			`Reserve Inventory failed: Could not create reservation record`,
+		);
+	}
+
+	// Acquire Inventory
 	const result = await inventory.updateOne(
 		{ uid: inventoryRecord.uid, quantity: { $gte: quantity } },
-		{ $inc: { reservedQuantity: quantity, quantity: -quantity } },
+		{
+			$inc: { reservedQuantity: quantity, quantity: -quantity },
+			$set: { [`reservations.${reservationRecord.uid}`]: quantity },
+		},
 	);
 	if (!result.matchedCount) {
 		throw new Error(
@@ -233,22 +256,25 @@ async function reserveNonSerializedInventory(
 		);
 	}
 
-	const reservationRecord = buildReservationRecord(
-		inventoryRecord.uid,
-		quantity,
+	// Activate Reservation
+	const reservationUpdResult = await reservations.updateOne(
+		{ uid: reservationRecord.uid },
+		{ $set: { status: Types.ReservationStatus.Active } },
 	);
-	const reservationResult = await reservation.insertOne(reservationRecord);
-	if (!reservationResult.insertedId) {
+	if (!reservationUpdResult.modifiedCount) {
 		throw new Error("Reserve Inventory failed: Database error");
 	}
 	return reservationRecord;
 }
 
-// Reservations expires automatically after a certain period
-// This method cancels them and replenishes stock quantity
-async function invalidateOldReservations() {
+/**
+ * Server may crash while ReservingInventory. Thus, any inventory acquired
+ * without fully making an `Active` reservation, needs to be released, and
+ * reservation record invalidated.
+ */
+async function invalidatePartialReservations() {
 	const claimToken = uuidv4();
-	const claimCandidateUids = await findCandidateUids(
+	const claimCandidateUids = await findOldPartialReservationUids(
 		ReservationInvalidationBatchSize,
 	);
 	const claimedReservations = await claimReservations(
@@ -262,22 +288,61 @@ async function invalidateOldReservations() {
 	);
 
 	try {
-		await Db.RunTransaction(async () => {
-			await releaseInventory(claimedReservations);
-			await releaseItems(claimedReservationUids);
-			await markReservationsInvalidated(claimedReservationUids);
-		});
+		await releaseInventory(claimedReservations);
+		await releaseItems(claimedReservationUids);
+		await markReservationsInvalidated(claimedReservationUids);
 		console.log(
-			`Inventory: InvalidateReservations succeeded: ${claimedReservationUids.join(",")}`,
+			`Inventory: ReleasePartialReservations succeeded: ${claimedReservationUids.join(",")}`,
 		);
 	} catch (err: any) {
 		console.error(
-			`Inventory: InvalidateReservations failed: ${claimedReservationUids.join(",")}: ${err.message}`,
+			`Inventory: ReleasePartialReservations failed: ${claimedReservationUids.join(",")}: ${err.message}`,
 		);
 		console.debug(err);
 	}
 }
 
+/**
+ * Clears up `Active` Reservations which were created long ago.
+ * This is needed to ensure, reservations which are not fulfilled
+ * for a long time gets auto-invalidated
+ */
+async function invalidateOldReservations() {
+	const claimToken = uuidv4();
+	const claimCandidateUids = await findOldActiveReservationUids(
+		ReservationInvalidationBatchSize,
+	);
+	const claimedReservations = await claimReservations(
+		claimCandidateUids,
+		claimToken,
+	);
+	const claimedReservationUids = claimedReservations.map((el) => el.uid);
+	console.debug(
+		"DEBUG: Invalid Reservations:",
+		claimedReservationUids.join(","),
+	);
+
+	try {
+		await releaseInventory(claimedReservations);
+		await releaseItems(claimedReservationUids);
+		await markReservationsInvalidated(claimedReservationUids);
+		console.log(
+			`Inventory: InvalidateOldReservations succeeded: ${claimedReservationUids.join(",")}`,
+		);
+	} catch (err: any) {
+		console.error(
+			`Inventory: InvalidateOldReservations failed: ${claimedReservationUids.join(",")}: ${err.message}`,
+		);
+		console.debug(err);
+	}
+}
+
+/**
+ * `invalidateOldReservations()` might be running when(if) the server crashes.
+ * This will cause reservations which were picked up but not fully invalidated
+ * to revert back to `Active` status so that future run of this job can pick
+ * them up again.
+ */
 async function recoverCrashedInvalidations() {
 	const reservations = Db.GetCollection<Types.Reservation>("reservations");
 	const crashDetectionTimestamp = new Date(
@@ -297,18 +362,38 @@ async function recoverCrashedInvalidations() {
 	);
 }
 
-function findCandidateUids(nMaxCandidates: number) {
+function findOldPartialReservationUids(limit: number) {
 	const reservations = Db.GetCollection<Types.Reservation>("reservations");
 	const invalidationTimestamp = new Date(
 		Date.now() - ReservationInvalidationTimeoutMs,
 	);
 	const pickupCriteria = {
 		createdAt: { $lt: invalidationTimestamp },
+		status: Types.ReservationStatus.Created,
 		invalidation: { $exists: false },
 	};
 	return reservations
 		.find(pickupCriteria, {
-			limit: nMaxCandidates,
+			limit,
+			projection: { uid: true },
+		})
+		.map((el) => el.uid)
+		.toArray();
+}
+
+function findOldActiveReservationUids(limit: number) {
+	const reservations = Db.GetCollection<Types.Reservation>("reservations");
+	const invalidationTimestamp = new Date(
+		Date.now() - ReservationInvalidationTimeoutMs,
+	);
+	const pickupCriteria = {
+		createdAt: { $lt: invalidationTimestamp },
+		status: Types.ReservationStatus.Active,
+		invalidation: { $exists: false },
+	};
+	return reservations
+		.find(pickupCriteria, {
+			limit,
 			projection: { uid: true },
 		})
 		.map((el) => el.uid)
@@ -367,10 +452,8 @@ function buildInventoryReleaseOperations(
 		updateOne: {
 			filter: { uid: el.inventoryUid },
 			update: {
-				$inc: {
-					quantity: el.quantity,
-					reservedQuantity: -el.quantity,
-				},
+				$inc: { quantity: el.quantity },
+				$unset: { [`reservations.${el.uid}`]: true },
 				$set: { updatedAt: new Date() },
 			},
 		},
@@ -383,7 +466,7 @@ function releaseItems(reservationUids: string[]) {
 		{ reservationUid: { $in: reservationUids } },
 		{
 			$set: {
-				status: Types.ItemStatus.Fresh,
+				status: Types.ItemStatus.Available,
 				updatedAt: new Date(),
 			},
 			$unset: { reservationUid: true },
