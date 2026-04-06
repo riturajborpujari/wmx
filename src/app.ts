@@ -11,7 +11,7 @@ app.use(requestLogger);
 app.use("/sku", skuRouter);
 app.use("/inventory", inventoryRouter);
 app.get("/health", (req: express.Request, res: express.Response) => {
-	res.status(200).json({message: "OK"})
-})
+	res.status(200).json({ message: "OK" });
+});
 
 export default app;
